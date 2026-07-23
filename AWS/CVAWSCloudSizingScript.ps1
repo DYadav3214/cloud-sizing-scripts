@@ -656,15 +656,16 @@ function Process-EC2Instance {
                         else { 'Unprotected' }
 
     $ec2Obj = [PSCustomObject]@{
-        AwsAccountId          = "`u{200B}$($AccountInfo.Account)"
+        AwsAccountId          = $AccountInfo.Account
         AwsAccountAlias       = $AccountAlias
         Region                = $Region
         InstanceId            = $Item.InstanceId
-        InstanceType          = $Item.InstanceType
+        InstanceType          = if ($Item.InstanceType -and $Item.InstanceType.PSObject.Properties.Name -contains 'Value') { $Item.InstanceType.Value } else { [string]$Item.InstanceType }
         Platform              = $platform
-        State                 = $Item.State.Name
+        State                 = if ($Item.State -and $Item.State.Name) { if ($Item.State.Name.PSObject.Properties.Name -contains 'Value') { $Item.State.Name.Value } else { [string]$Item.State.Name } } else { 'unknown' }
         LaunchTime            = $Item.LaunchTime
         IamInstanceProfile    = $iamProfile
+        LaunchDays            = if ($Item.LaunchTime) { [math]::Round((New-TimeSpan -Start $Item.LaunchTime -End (Get-Date)).TotalDays, 0) } else { $null }
         VolumeCount           = $ebsVolumes.Count
         SizeGiB               = $sizes.SizeGiB
         SizeTiB               = $sizes.SizeTiB
@@ -676,6 +677,7 @@ function Process-EC2Instance {
         AWSBackupProtected    = $awsBackupProtected
         EBSSnapshotCount      = $snapshotCount
         LatestSnapshotDate    = $latestSnapshotDate
+        DaysSinceLastBackup   = if ($latestSnapshotDate) { [math]::Round((New-TimeSpan -Start $latestSnapshotDate -End (Get-Date)).TotalDays, 0) } else { $null }
         ProtectionStatus      = $protectionStatus
     }
 
@@ -813,9 +815,10 @@ function Process-S3Bucket {
         try {
             $encConfig = Get-S3BucketEncryption -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
             if ($encConfig -and $encConfig.ServerSideEncryptionRules -and $encConfig.ServerSideEncryptionRules.Count -gt 0) {
-                $serverSideEncryption = $encConfig.ServerSideEncryptionRules[0].ServerSideEncryptionByDefault.SSEAlgorithm
+                $sse = $encConfig.ServerSideEncryptionRules[0].ServerSideEncryptionByDefault.SSEAlgorithm
+                $serverSideEncryption = if ($sse -and $sse.PSObject.Properties.Name -contains 'Value') { $sse.Value } else { [string]$sse }
             }
-        } catch { $serverSideEncryption = 'Unknown' }
+        } catch { $serverSideEncryption = 'None' }
 
         # ── Protection status inference ───────────────────────────────────
         $s3ProtectionStatus = if ($replicationEnabled -and $versioningStatus -eq 'Enabled') { 'Protected' }
@@ -824,7 +827,7 @@ function Process-S3Bucket {
                               else { 'Unprotected' }
 
         $s3Obj = [PSCustomObject]@{
-            AwsAccountId          = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountId          = "$($AccountInfo.Account)"
             AwsAccountAlias       = $AccountAlias
             Region                = $actualRegion
             BucketName            = $bucketName
@@ -897,14 +900,14 @@ function Process-EFSFileSystem {
                            else { 'Unprotected' }
 
     $efsObj = [PSCustomObject]@{
-        AwsAccountId       = "`u{200B}$($AccountInfo.Account)"
+        AwsAccountId       = $AccountInfo.Account
         AwsAccountAlias    = $AccountAlias
         Region             = $Region
         FileSystemId       = $Item.FileSystemId
         CreationTime       = $Item.CreationTime
-        PerformanceMode    = $Item.PerformanceMode
+        PerformanceMode    = if ($Item.PerformanceMode -and $Item.PerformanceMode.PSObject.Properties.Name -contains 'Value') { $Item.PerformanceMode.Value } else { [string]$Item.PerformanceMode }
         ThroughputMode     = $throughputMode
-        State              = $Item.LifeCycleState
+        State              = if ($Item.LifeCycleState -and $Item.LifeCycleState.PSObject.Properties.Name -contains 'Value') { $Item.LifeCycleState.Value } else { [string]$Item.LifeCycleState }
         Encrypted          = $efsEncrypted
         BackupPolicyStatus = $backupPolicyStatus
         ProtectionStatus   = $efsProtectionStatus
@@ -964,7 +967,7 @@ function Process-FSXFileSystem {
     $sizes = Convert-BytesToSizes -Bytes $capacityBytes
 
     $fsxObj = [PSCustomObject]@{
-        AwsAccountId = "`u{200B}$($AccountInfo.Account)"
+        AwsAccountId = "$($AccountInfo.Account)"
         AwsAccountAlias = $AccountAlias
         Region = $Region
         FileSystemId = $Item.FileSystemId
@@ -1058,7 +1061,7 @@ function Process-FSXStorageVirtualMachine {
         $sizes = Convert-BytesToSizes -Bytes $totalBytes
 
         $obj = [PSCustomObject]@{
-            AwsAccountId          = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountId          = "$($AccountInfo.Account)"
             AwsAccountAlias       = $AccountAlias
             Region                = $Region
             FileSystemId          = $fileSystemId
@@ -1271,7 +1274,7 @@ function Process-EKSCluster {
          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tmpKube)) {
              Write-ScriptOutput "EKS: Failed to update kubeconfig for ${clusterName} in ${Region}: ${updateResult}" -Level Warning
              return [PSCustomObject]@{
-                 AwsAccountId    = "`u{200B}$($AccountInfo.Account)"
+                 AwsAccountId    = "$($AccountInfo.Account)"
                  AwsAccountAlias = $AccountInfo.AccountAlias
                  Region          = $Region
                  ClusterName     = $clusterName
@@ -1360,7 +1363,7 @@ function Process-EKSCluster {
         $sizeTB  = [math]::Round($sizeGB / 1024, 6)
 
         return [PSCustomObject]@{
-            AwsAccountId    = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountId    = "$($AccountInfo.Account)"
             AwsAccountAlias = $AccountInfo.AccountAlias
             Region          = $Region
             ClusterName     = $clusterName
@@ -1422,15 +1425,16 @@ function Process-UnattachedVolume {
     $volEncrypted = if ($Item.Encrypted -ne $null) { [bool]$Item.Encrypted } else { $null }
 
     $volumeObj = [PSCustomObject]@{
-        AwsAccountId    = "`u{200B}$($AccountInfo.Account)"
+        AwsAccountId    = $AccountInfo.Account
         AwsAccountAlias = $AccountAlias
         Region          = $Region
         VolumeId        = $Item.VolumeId
-        VolumeType      = $Item.VolumeType
+        VolumeType      = if ($Item.VolumeType -and $Item.VolumeType.PSObject.Properties.Name -contains 'Value') { $Item.VolumeType.Value } else { [string]$Item.VolumeType }
         Size            = $Item.Size
-        State           = $Item.State
+        State           = if ($Item.State -and $Item.State.PSObject.Properties.Name -contains 'Value') { $Item.State.Value } else { [string]$Item.State }
         Encrypted       = $volEncrypted
         CreateTime      = $Item.CreateTime
+        DaysSinceCreation = if ($Item.CreateTime) { [math]::Round((New-TimeSpan -Start $Item.CreateTime -End (Get-Date)).TotalDays, 0) } else { $null }
         SizeGiB         = $sizes.SizeGiB
         SizeTiB         = $sizes.SizeTiB
         SizeGB          = $sizes.SizeGB
@@ -1529,7 +1533,7 @@ function Process-RDSInstance {
         $latestRestorableTime = if ($Item.LatestRestorableTime) { $Item.LatestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
 
         $rdsObj = [PSCustomObject]@{
-            AwsAccountId            = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountId            = "$($AccountInfo.Account)"
             AwsAccountAlias         = $AccountAlias
             Region                  = $Region
             DBInstanceIdentifier    = $Item.DBInstanceIdentifier
@@ -1571,6 +1575,13 @@ function Process-DocumentDBCluster {
     try {
         $clusterId = $Item.DBClusterIdentifier
         $engine = if ($Item.Engine) { $Item.Engine } else { "docdb" }
+
+        # Guard: skip Aurora clusters that may surface via fallback API calls
+        if ($engine -match '^aurora') {
+            Write-ScriptOutput "Skipping Aurora cluster '$clusterId' in DocumentDB processor (engine='$engine')" -Level Info
+            return $null
+        }
+
         $engineVersion = if ($Item.EngineVersion) { $Item.EngineVersion } else { "Unknown" }
         $clusterStatus = if ($Item.Status) { $Item.Status } else { "Unknown" }
         
@@ -1630,7 +1641,7 @@ function Process-DocumentDBCluster {
         $docdbEarliestRestore = if ($Item.EarliestRestorableTime) { $Item.EarliestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
 
         $docdbClusterObj = [PSCustomObject]@{
-            AwsAccountId          = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountId          = "$($AccountInfo.Account)"
             AwsAccountAlias       = $AccountAlias
             Region                = $Region
             DBClusterIdentifier   = $clusterId
@@ -1695,7 +1706,7 @@ function Process-AuroraCluster {
         $aurEarliestRestore = if ($Item.EarliestRestorableTime) { $Item.EarliestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
 
         $auroraObj = [PSCustomObject]@{
-            AwsAccountId          = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountId          = "$($AccountInfo.Account)"
             AwsAccountAlias       = $AccountAlias
             Region                = $Region
             DBClusterIdentifier   = $clusterId
@@ -1751,7 +1762,7 @@ function Process-ElastiCacheCluster {
         $totalRamGB = [math]::Round($approxRamGB * $nodeCount, 2)
 
         $ecObj = [PSCustomObject]@{
-            AwsAccountId       = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountId       = "$($AccountInfo.Account)"
             AwsAccountAlias    = $AccountAlias
             Region             = $Region
             CacheClusterId     = $Item.CacheClusterId
@@ -1788,7 +1799,7 @@ function Process-AWSBackupResource {
         } catch {}
 
         return [PSCustomObject]@{
-            AwsAccountId      = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountId      = "$($AccountInfo.Account)"
             AwsAccountAlias   = $AccountAlias
             Region            = $Region
             ResourceArn       = $Item.ResourceArn
@@ -1860,7 +1871,7 @@ function Process-DynamoDBTable {
         $ddbProtectionStatus = if ($pitrEnabled) { 'Protected' } else { 'Unprotected' }
 
         $ddbObj = [PSCustomObject]@{
-            AwsAccountId     = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountId     = "$($AccountInfo.Account)"
             AwsAccountAlias  = $AccountAlias
             Region           = $Region
             TableName        = $tableName
@@ -1960,7 +1971,7 @@ function Process-RedshiftCluster {
         $rsProtectionStatus = if ($rsAutomatedSnapshotRetention -gt 0) { 'Automated-Backup' } else { 'Unprotected' }
 
         $rsObj = [PSCustomObject]@{
-            AwsAccountId                    = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountId                    = "$($AccountInfo.Account)"
             AwsAccountAlias                 = $AccountAlias
             Region                          = $Region
             ClusterIdentifier               = $clusterId
@@ -3764,7 +3775,7 @@ try {
                 cloud          = "aws"
                 accounts       = @($script:AccountsProcessed | ForEach-Object { $_.Account })
                 generated_at   = (Get-Date -Format "o")
-                script_version = "2.0"
+                script_version = "2.1"
             }
             summary            = $jsonSummary
             protection_summary = $protectionSummary
@@ -3804,3 +3815,5 @@ catch {
     Write-ScriptOutput "Critical error in main execution: $_" -Level Error
     exit 1
 }
+
+
