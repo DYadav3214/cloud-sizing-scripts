@@ -124,7 +124,7 @@
 
 
 param(
-    [ValidateSet('VM','Storage','Fileshare','DB','GKE', IgnoreCase = $true)]
+    [ValidateSet('VM','Storage','Fileshare','DB','GKE','Filestore','Snapshot', IgnoreCase = $true)]
     [string[]]$Types,
     [string[]]$Projects,
     [switch]$LightMode,               # Leaner concurrency model
@@ -134,7 +134,8 @@ param(
     [int]$VMProjectTimeoutSec         = 600,   # 10m
     [int]$BucketProjectListTimeoutSec = 300,   # 5m
     [int]$BucketSizingTimeoutSec      = 1200,  # 20m
-    [int]$DbProjectTimeoutSec         = 900    # 15m per project for DB inventory (soft)
+    [int]$DbProjectTimeoutSec         = 900,   # 15m per project for DB inventory (soft)
+    [ValidateSet("csv","json","both")][string]$OutputFormat = "csv"  # Output format: csv (default), json, or both
 )
 
 # Normalize -Projects if provided as a single comma-separated string inside quotes
@@ -152,10 +153,10 @@ $env:CLOUDSDK_CORE_DISABLE_PROMPTS = '1'
 
 # Post-normalization validation for -Types (case-insensitive)
 if ($Types) {
-    $allowed = @('VM','STORAGE','FILESHARE','DB','GKE')
+    $allowed = @('VM','STORAGE','FILESHARE','DB','GKE','FILESTORE','SNAPSHOT')
     $bad = $Types | Where-Object { $allowed -notcontains ($_.Trim().ToUpper()) }
     if ($bad.Count -gt 0) {
-    Write-Error ("Invalid value(s) for -Types: {0}. Valid values: VM, Storage, Fileshare, DB" -f ($bad -join ', '))
+        Write-Error ("Invalid value(s) for -Types: {0}. Valid values: VM, Storage, Fileshare, DB, GKE, Filestore, Snapshot" -f ($bad -join ', '))
         return
     }
 }
@@ -194,6 +195,8 @@ $ResourceTypeMap = @{
     "FILESHARE" = "FileShares"
     "DB"        = "Databases"
     "GKE"       = "GKEClusters"
+    "FILESTORE" = "FilestoreInstances"
+    "SNAPSHOT"  = "DiskSnapshots"
 }
 
 # Normalize types
@@ -2438,6 +2441,80 @@ if ($Selected.FILESHARE) {
     }
 }
 
+# ---------------------------------------------------------------
+# FILESTORE INSTANCES (Cloud Filestore managed NFS)
+# ---------------------------------------------------------------
+function Get-GcpFilestoreInventory {
+    param([string[]]$ProjectIds)
+    $results = @()
+    foreach ($proj in $ProjectIds) {
+        try {
+            $raw = gcloud --quiet filestore instances list --project $proj --format=json 2>$null | ConvertFrom-Json
+            if (-not $raw) { continue }
+            foreach ($inst in $raw) {
+                foreach ($fs in $inst.fileShares) {
+                    $results += [PSCustomObject]@{
+                        Project       = $proj
+                        InstanceName  = $inst.name -replace '.*/instances/',''
+                        Region        = $inst.location
+                        Tier          = $inst.tier
+                        State         = $inst.state
+                        CapacityGB    = [math]::Round($fs.capacityGb, 2)
+                        CapacityTB    = [math]::Round($fs.capacityGb / 1000, 4)
+                        ShareName     = $fs.name
+                        Protocol      = if ($inst.protocol) { $inst.protocol } else { 'NFS' }
+                        Networks      = ($inst.networks | ForEach-Object { $_.network }) -join ';'
+                        CreateTime    = $inst.createTime
+                    }
+                }
+            }
+        } catch { Write-Log "Filestore inventory failed for project ${proj}: $_" -Level WARN }
+    }
+    return $results
+}
+
+# ---------------------------------------------------------------
+# DISK SNAPSHOTS (backup coverage proxy)
+# ---------------------------------------------------------------
+function Get-GcpSnapshotInventory {
+    param([string[]]$ProjectIds)
+    $results = @()
+    foreach ($proj in $ProjectIds) {
+        try {
+            $raw = gcloud --quiet compute snapshots list --project $proj --format=json 2>$null | ConvertFrom-Json
+            if (-not $raw) { continue }
+            foreach ($snap in $raw) {
+                $results += [PSCustomObject]@{
+                    Project         = $proj
+                    SnapshotName    = $snap.name
+                    SourceDisk      = ($snap.sourceDisk -replace '.*/disks/','')
+                    SourceDiskZone  = if ($snap.sourceDisk -match '/zones/([^/]+)/') { $Matches[1] } else { 'Unknown' }
+                    Region          = if ($snap.sourceDisk -match '/zones/([^/]+)/') { $Matches[1] -replace '-[a-z]$','' } else { 'Unknown' }
+                    StorageGB       = [math]::Round($snap.storageBytes / 1e9, 2)
+                    StorageTB       = [math]::Round($snap.storageBytes / 1e12, 4)
+                    DiskSizeGB      = $snap.diskSizeGb
+                    Status          = $snap.status
+                    CreationTime    = $snap.creationTimestamp
+                    StorageLocations = ($snap.storageLocations -join ';')
+                    Labels          = if ($snap.labels) { ($snap.labels.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ';' } else { '' }
+                }
+            }
+        } catch { Write-Log "Snapshot inventory failed for project ${proj}: $_" -Level WARN }
+    }
+    return $results
+}
+
+if ($Selected.FILESTORE) {
+    Write-Host "Collecting Cloud Filestore instances..." -ForegroundColor Cyan
+    $invResults.FilestoreInstances = Get-GcpFilestoreInventory -ProjectIds $targetProjects
+    Write-Host "Found $($invResults.FilestoreInstances.Count) Filestore shares." -ForegroundColor Green
+}
+if ($Selected.SNAPSHOT) {
+    Write-Host "Collecting disk snapshots (backup coverage)..." -ForegroundColor Cyan
+    $invResults.DiskSnapshots = Get-GcpSnapshotInventory -ProjectIds $targetProjects
+    Write-Host "Found $($invResults.DiskSnapshots.Count) snapshots." -ForegroundColor Green
+}
+
 # ================= DB CSV EXPORTS =================
 # Helper must be defined before usage
 if (-not (Get-Command Add-BlankLines -ErrorAction SilentlyContinue)) {
@@ -3008,7 +3085,28 @@ $fileshareData = $invResults.FileShares
 if ($fileshareData) { $fileshareData = $fileshareData | Where-Object { -not ($_.Error -and $_.Error.Trim()) } }
 $databaseData = $invResults.Databases
 if ($databaseData) { $databaseData = $databaseData | Where-Object { -not ($_.Error -and $_.Error.Trim()) -and $_.Type -ne 'Error' } }
- $gkeData = $invResults.GKEClusters
+$gkeData = $invResults.GKEClusters
+$filestoreData = $invResults.FilestoreInstances
+$snapshotData = $invResults.DiskSnapshots
+
+# Filestore CSV
+if ($Selected.FILESTORE -and $filestoreData -and $filestoreData.Count -gt 0) {
+    $fstoreCsv = Join-Path $outDir ("gcp_filestore_instances_" + $dateStr + ".csv")
+    Write-PlainCsv -Data $filestoreData -Path $fstoreCsv
+    Write-Host "Filestore CSV written: $(Split-Path $fstoreCsv -Leaf)" -ForegroundColor Cyan
+}
+
+# Snapshots CSV
+if ($Selected.SNAPSHOT -and $snapshotData -and $snapshotData.Count -gt 0) {
+    $snapCsv = Join-Path $outDir ("gcp_disk_snapshots_" + $dateStr + ".csv")
+    Write-PlainCsv -Data $snapshotData -Path $snapCsv
+    # Append summary
+    Add-Content -Path $snapCsv -Value ''
+    Add-Content -Path $snapCsv -Value 'Summary:'
+    $totalSnapGB = ($snapshotData | Measure-Object StorageGB -Sum).Sum
+    Add-Content -Path $snapCsv -Value ("TotalSnapshots,{0},TotalStorageGB,{1},TotalStorageTB,{2}" -f $snapshotData.Count,[math]::Round($totalSnapGB,2),[math]::Round($totalSnapGB/1000,4))
+    Write-Host "Snapshots CSV written: $(Split-Path $snapCsv -Leaf)" -ForegroundColor Cyan
+}
 
 # Fallback: if user requested only DB (or DB included) and nothing discovered, capture zero rows so summary isn't just blank spacers
 if ($Selected.DB -and (-not $databaseData -or $databaseData.Count -eq 0)) {
@@ -3213,6 +3311,48 @@ $summaryCsv = Join-Path $outDir ("gcp_inventory_summary_" + $dateStr + ".csv")
 Write-PlainCsv -Data $summaryRows -Path $summaryCsv
 Write-Host "Inventory summary exported: $(Split-Path $summaryCsv -Leaf)" -ForegroundColor Green
 
+# ============================================================
+# JSON EXPORT (when OutputFormat is json or both)
+# ============================================================
+if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
+    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing JSON output..." -PercentComplete 72
+
+    $jsonSummary = @{}
+    $allWorkloads = @{}
+
+    if ($AllVMs -and $AllVMs.Count -gt 0) {
+        $allWorkloads["gcp_vms"]         = @($AllVMs)
+        $jsonSummary["VM"]               = @{ count = $AllVMs.Count; total_storage_gb = [double](($AllVMs | Measure-Object -Property SizeGB -Sum -ErrorAction SilentlyContinue).Sum); notes = "" }
+    }
+    if ($AllBuckets -and $AllBuckets.Count -gt 0) {
+        $allWorkloads["gcp_storage"]     = @($AllBuckets)
+        $jsonSummary["Storage"]          = @{ count = $AllBuckets.Count; total_storage_gb = [double](($AllBuckets | Measure-Object -Property SizeGB -Sum -ErrorAction SilentlyContinue).Sum); notes = "" }
+    }
+    if ($filestoreData -and $filestoreData.Count -gt 0) {
+        $allWorkloads["gcp_filestore"]   = @($filestoreData)
+        $jsonSummary["Filestore"]        = @{ count = $filestoreData.Count; total_storage_gb = [double](($filestoreData | Measure-Object -Property CapacityGB -Sum -ErrorAction SilentlyContinue).Sum); notes = "" }
+    }
+    if ($snapshotData -and $snapshotData.Count -gt 0) {
+        $allWorkloads["gcp_snapshots"]   = @($snapshotData)
+        $jsonSummary["Snapshot"]         = @{ count = $snapshotData.Count; total_storage_gb = [double](($snapshotData | Measure-Object -Property StorageGB -Sum -ErrorAction SilentlyContinue).Sum); notes = "" }
+    }
+
+    $jsonDoc = @{
+        metadata = @{
+            cloud          = "gcp"
+            projects       = @($activeProjects)
+            generated_at   = (Get-Date -Format "o")
+            script_version = "2.0"
+        }
+        summary   = $jsonSummary
+        workloads = $allWorkloads
+    }
+
+    $jsonPath = Join-Path $outDir ("gcp_sizing_" + $dateStr + ".json")
+    $jsonDoc | ConvertTo-Json -Depth 10 | Set-Content -Path $jsonPath -Encoding UTF8
+    Write-Host "gcp_sizing_$dateStr.json written to $outDir" -ForegroundColor Cyan
+}
+
 # -------------------------
 # Finalize log, then ZIP
 # -------------------------
@@ -3241,4 +3381,7 @@ try {
 
 Write-Progress -Id 5 -Activity "Generating Output Files" -Completed
 Write-Host "`nInventory complete. Results in $zipFile`n" -ForegroundColor Green
+if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
+    Write-Host "JSON sizing report (gcp_sizing_$dateStr.json) is included in the ZIP for Sales AI Hub upload." -ForegroundColor Cyan
+}
 Write-Host "All output files (including the log) are compressed into the ZIP archive." -ForegroundColor Cyan

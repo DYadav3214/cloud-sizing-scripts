@@ -204,8 +204,11 @@
 #>  
   
 param(  
-    [string[]]$Types, # Choices: VM, Storage, FileShare, NetApp, SQL, Cosmos, AKS  
-    [string[]]$Subscriptions # Subscription names or IDs to target (if not specified, all subscriptions will be processed)
+    [string[]]$Types, # Choices: VM, Storage, FileShare, NetApp, SQL, Cosmos, AKS, Backup, UnmanagedDisks, AVS
+    [string[]]$Subscriptions, # Subscription names or IDs to target (if not specified, all subscriptions will be processed)
+    [string]$EnvTagName  = "Environment",   # Tag key used to identify environment (e.g. "Environment", "Env")
+    [string[]]$EnvTagValues,                 # Filter to these tag values only (e.g. "Production","Prod"). If omitted, all resources are included.
+    [ValidateSet("csv","json","both")][string]$OutputFormat = "csv"  # Output format: csv (default), json, or both
 )  
 
 # AKS Helper Functions
@@ -483,14 +486,27 @@ $CurrentCulture = [System.Globalization.CultureInfo]::CurrentCulture
   
 # Resource type mapping  
 $ResourceTypeMap = @{  
-    "VM"         = "VMs"  
-    "STORAGE"    = "StorageAccounts"
-    "FILESHARE"  = "FileShares"
-    "NETAPP"     = "NetAppVolumes"
-    "SQL"        = "SqlInventory"
-    "COSMOS"     = "CosmosDBs"
-    "AKS"        = "AKSClusters"
+    "VM"             = "VMs"  
+    "STORAGE"        = "StorageAccounts"
+    "FILESHARE"      = "FileShares"
+    "NETAPP"         = "NetAppVolumes"
+    "SQL"            = "SqlInventory"
+    "COSMOS"         = "CosmosDBs"
+    "AKS"            = "AKSClusters"
+    "BACKUP"         = "BackupItems"
+    "UNMANAGEDISKS"  = "UnmanagedDisks"
+    "AVS"            = "AVSClusters"
 }  
+
+# Environment tag filter helper — returns $true if resource should be included
+function Test-EnvTagMatch {
+    param([hashtable]$Tags)
+    if (-not $EnvTagValues -or $EnvTagValues.Count -eq 0) { return $true }
+    if (-not $Tags) { return $false }
+    $tagVal = $Tags[$EnvTagName]
+    if (-not $tagVal) { return $false }
+    return ($EnvTagValues | Where-Object { $_ -ieq $tagVal }).Count -gt 0
+}
   
 # Normalize types  
 if ($Types) {  
@@ -505,10 +521,10 @@ if ($Types) {
         }
     }  
     if ($invalidTypes.Count -gt 0) {
-        Write-Host "Invalid type(s) specified: $($invalidTypes -join ', '). Valid types are: VM, Storage, FileShare, NetApp, SQL, Cosmos, AKS" -ForegroundColor Red
+        Write-Host "Invalid type(s) specified: $($invalidTypes -join ', '). Valid types are: VM, Storage, FileShare, NetApp, SQL, Cosmos, AKS, Backup, UnmanagedDisks, AVS" -ForegroundColor Red
     }
     if ($Selected.Count -eq 0) {  
-        Write-Host "No valid -Types specified. Use: VM, Storage, FileShare, NetApp, SQL, Cosmos, AKS" -ForegroundColor Red
+        Write-Host "No valid -Types specified. Use: VM, Storage, FileShare, NetApp, SQL, Cosmos, AKS, Backup, UnmanagedDisks, AVS" -ForegroundColor Red
         exit 1  
     }  
 } else {  
@@ -568,18 +584,21 @@ if ($BlobLimit -gt 0) { Write-Host "  BlobLimit: $BlobLimit" -ForegroundColor Gr
   
 # Define module requirements for each resource type
 $ResourceTypeModules = @{
-    VM = @('Az.Accounts', 'Az.Compute')
-    STORAGE = @('Az.Accounts', 'Az.Storage', 'Az.Monitor')
-    FILESHARE = @('Az.Accounts', 'Az.Storage')
-    NETAPP = @('Az.Accounts', 'Az.NetAppFiles', 'Az.Monitor', 'Az.Resources')
-    SQL = @('Az.Accounts', 'Az.Sql', 'Az.MySql', 'Az.PostgreSql', 'Az.Monitor')
-    COSMOS = @('Az.Accounts', 'Az.CosmosDB', 'Az.Monitor')
-    AKS = @('Az.Accounts', 'Az.Aks', 'Az.Resources')
+    VM             = @('Az.Accounts', 'Az.Compute')
+    STORAGE        = @('Az.Accounts', 'Az.Storage', 'Az.Monitor')
+    FILESHARE      = @('Az.Accounts', 'Az.Storage')
+    NETAPP         = @('Az.Accounts', 'Az.NetAppFiles', 'Az.Monitor', 'Az.Resources')
+    SQL            = @('Az.Accounts', 'Az.Sql', 'Az.MySql', 'Az.PostgreSql', 'Az.Monitor')
+    COSMOS         = @('Az.Accounts', 'Az.CosmosDB', 'Az.Monitor')
+    AKS            = @('Az.Accounts', 'Az.Aks', 'Az.Resources')
+    BACKUP         = @('Az.Accounts', 'Az.RecoveryServices')
+    UNMANAGEDISKS  = @('Az.Accounts', 'Az.Compute')
+    AVS            = @('Az.Accounts', 'Az.VMware')
 }
 
 # Load modules  
 $modules = @(  
-    'Az.Accounts','Az.Compute','Az.Storage','Az.Monitor','Az.Resources','Az.NetAppFiles','Az.CosmosDB','Az.Sql','Az.MySql','Az.PostgreSql','Az.Aks'  
+    'Az.Accounts','Az.Compute','Az.Storage','Az.Monitor','Az.Resources','Az.NetAppFiles','Az.CosmosDB','Az.Sql','Az.MySql','Az.PostgreSql','Az.Aks','Az.RecoveryServices','Az.VMware'
 )  
 foreach ($m in $modules) {  
     try { Import-Module $m -ErrorAction Stop } catch { Write-Warning "Could not load $m" }  
@@ -654,6 +673,9 @@ $PostgreSQLServers = @()
 $AKSClusters = @()
 $AKSPersistentVolumes = @()
 $AKSPersistentVolumeClaims = @()
+$BackupItems = @()
+$UnmanagedDiskItems = @()
+$AVSClusters = @()
 
 # Process each subscription sequentially
 $subIdx = 0
@@ -665,6 +687,13 @@ foreach ($sub in $subs) {
     Set-AzContext -SubscriptionId $sub.Id | Out-Null
   
     # VMs  
+    # ---------------------------------------------------------------
+    # ENVIRONMENT TAG FILTER: log filter status once per subscription
+    # ---------------------------------------------------------------
+    if ($EnvTagValues -and $EnvTagValues.Count -gt 0) {
+        Write-Host "  [EnvFilter] Filtering to resources where tag '$EnvTagName' in ($($EnvTagValues -join ', '))" -ForegroundColor DarkCyan
+    }
+
     if ($Selected.VM) {  
         try {
             Write-Host "Processing Virtual Machines in subscription $($sub.Name)" -ForegroundColor Green
@@ -724,16 +753,23 @@ foreach ($sub in $subs) {
                     }
                 }
                 
-                $VMs += [PSCustomObject]@{  
+                # Apply environment tag filter
+                if (-not (Test-EnvTagMatch -Tags $vm.Tags)) { continue }
+
+                # Flatten tags into Tag_Key columns
+                $vmObj = [ordered]@{
                     Subscription   = $sub.Name  
                     ResourceGroup  = $vm.ResourceGroupName  
                     VMName         = $vm.Name  
                     VMSize         = $vm.HardwareProfile.VmSize  
                     OS             = $vm.StorageProfile.OsDisk.OsType  
                     Region         = $vm.Location
+                    PowerState     = ($vm.Statuses | Where-Object Code -like 'PowerState/*' | Select-Object -First 1 -ExpandProperty DisplayStatus)
                     DiskCount      = $diskCount
                     VMDiskSizeGB   = $totalDiskSizeGB  
-                }  
+                }
+                if ($vm.Tags) { $vm.Tags.GetEnumerator() | ForEach-Object { $vmObj["Tag_$($_.Key)"] = $_.Value } }
+                $VMs += [PSCustomObject]$vmObj
             }
             }
             Write-Progress -Id 2 -Activity "Processing Virtual Machines" -Completed
@@ -1771,6 +1807,119 @@ foreach ($sub in $subs) {
             Write-Warning "Error processing AKS clusters in subscription $($sub.Name): $($_.Exception.Message)"
         }
     }
+
+    # ---------------------------------------------------------------
+    # BACKUP COVERAGE (Azure Backup / Recovery Services Vaults)
+    # ---------------------------------------------------------------
+    if ($Selected.BACKUP) {
+        try {
+            Write-Host "Processing Azure Backup coverage in subscription $($sub.Name)" -ForegroundColor Green
+            $vaults = Get-AzRecoveryServicesVault -ErrorAction SilentlyContinue
+            if ($vaults) {
+                foreach ($vault in $vaults) {
+                    try {
+                        Set-AzRecoveryServicesVaultContext -Vault $vault | Out-Null
+                        # Fetch all backup items across common workload types
+                        $itemTypes = @('AzureVM','AzureStorage','MSSQL','SAPHanaDatabase')
+                        foreach ($wl in $itemTypes) {
+                            try {
+                                $items = Get-AzRecoveryServicesBackupItem -WorkloadType $wl -ErrorAction SilentlyContinue
+                                foreach ($item in $items) {
+                                    $BackupItems += [PSCustomObject]@{
+                                        Subscription        = $sub.Name
+                                        VaultName           = $vault.Name
+                                        VaultResourceGroup  = $vault.ResourceGroupName
+                                        VaultRegion         = $vault.Location
+                                        WorkloadType        = $wl
+                                        ItemName            = $item.Name
+                                        ContainerName       = $item.ContainerName
+                                        ProtectionStatus    = $item.ProtectionStatus
+                                        ProtectionState     = $item.ProtectionState
+                                        LastBackupStatus    = $item.LastBackupStatus
+                                        LastBackupTime      = $item.LastBackupTime
+                                        PolicyName          = $item.ProtectionPolicyName
+                                        DiskSizeGB          = if ($item.DiskSizeGB) { $item.DiskSizeGB } else { 'N/A' }
+                                    }
+                                }
+                            } catch { Write-Verbose "Workload $wl not available in vault $($vault.Name): $_" }
+                        }
+                    } catch { Write-Warning "Error processing vault $($vault.Name): $_" }
+                }
+            } else {
+                Write-Host "No Recovery Services vaults found in subscription $($sub.Name)" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Warning "Error processing Azure Backup in subscription $($sub.Name): $_"
+        }
+    }
+
+    # ---------------------------------------------------------------
+    # UNMANAGED DISKS (Orphaned / unattached managed disks)
+    # ---------------------------------------------------------------
+    if ($Selected.UNMANAGEDISKS) {
+        try {
+            Write-Host "Processing Unmanaged/Unattached Disks in subscription $($sub.Name)" -ForegroundColor Green
+            $allDisks = Get-AzDisk -ErrorAction SilentlyContinue
+            if ($allDisks) {
+                foreach ($disk in $allDisks) {
+                    if (-not (Test-EnvTagMatch -Tags $disk.Tags)) { continue }
+                    $diskObj = [ordered]@{
+                        Subscription    = $sub.Name
+                        ResourceGroup   = $disk.ResourceGroupName
+                        DiskName        = $disk.Name
+                        Region          = $disk.Location
+                        DiskSizeGB      = $disk.DiskSizeGB
+                        DiskSizeTB      = [math]::Round($disk.DiskSizeGB / 1000, 4)
+                        DiskState       = $disk.DiskState      # Unattached / Attached / Reserved
+                        DiskSku         = $disk.Sku.Name
+                        OsType          = $disk.OsType
+                        AttachedToVM    = if ($disk.ManagedBy) { ($disk.ManagedBy -split '/')[-1] } else { 'Unattached' }
+                        CreationTime    = $disk.TimeCreated
+                    }
+                    if ($disk.Tags) { $disk.Tags.GetEnumerator() | ForEach-Object { $diskObj["Tag_$($_.Key)"] = $_.Value } }
+                    $UnmanagedDiskItems += [PSCustomObject]$diskObj
+                }
+            }
+        } catch {
+            Write-Warning "Error processing disks in subscription $($sub.Name): $_"
+        }
+    }
+
+    # ---------------------------------------------------------------
+    # AZURE VMWARE SOLUTION (AVS)
+    # ---------------------------------------------------------------
+    if ($Selected.AVS) {
+        try {
+            Write-Host "Processing Azure VMware Solution in subscription $($sub.Name)" -ForegroundColor Green
+            $avsClouds = Get-AzVMwarePrivateCloud -ErrorAction SilentlyContinue
+            if ($avsClouds) {
+                foreach ($cloud in $avsClouds) {
+                    try {
+                        $clusters = Get-AzVMwareCluster -PrivateCloudName $cloud.Name -ResourceGroupName $cloud.ResourceGroupName -ErrorAction SilentlyContinue
+                        $totalHosts = ($clusters | Measure-Object -Property ClusterSize -Sum).Sum
+                        $AVSClusters += [PSCustomObject]@{
+                            Subscription        = $sub.Name
+                            ResourceGroup       = $cloud.ResourceGroupName
+                            PrivateCloudName    = $cloud.Name
+                            Region              = $cloud.Location
+                            Status              = $cloud.ProvisioningState
+                            ManagementClusterSize = $cloud.ManagementClusterSize
+                            ClusterCount        = if ($clusters) { $clusters.Count } else { 0 }
+                            TotalHostCount      = $totalHosts
+                            SkuName             = $cloud.SkuName
+                            CircuitPrimarySubnet = $cloud.CircuitPrimarySubnet
+                            NsxtVersion         = $cloud.NsxtVersion
+                            VcenterVersion      = $cloud.VcenterVersion
+                        }
+                    } catch { Write-Warning "Error processing AVS cloud $($cloud.Name): $_" }
+                }
+            } else {
+                Write-Host "No Azure VMware Solution private clouds found in subscription $($sub.Name)" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Warning "Error processing AVS in subscription $($sub.Name): $_"
+        }
+    }
 }  
 
 # Complete subscription progress
@@ -1856,6 +2005,18 @@ if ($Selected.AKS -and $AKSPersistentVolumeClaims.Count) {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing AKS Persistent Volume Claims CSV..." -PercentComplete 98
     $AKSPersistentVolumeClaims | Export-Csv (Join-Path $outdir "azure_aks_persistent_volume_claims_$dateStr.csv") -NoTypeInformation
     Write-Host "azure_aks_persistent_volume_claims_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
+}
+if ($Selected.BACKUP -and $BackupItems.Count) {
+    $BackupItems | Export-Csv (Join-Path $outdir "azure_backup_items_$dateStr.csv") -NoTypeInformation
+    Write-Host "azure_backup_items_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
+}
+if ($Selected.UNMANAGEDISKS -and $UnmanagedDiskItems.Count) {
+    $UnmanagedDiskItems | Export-Csv (Join-Path $outdir "azure_disks_inventory_$dateStr.csv") -NoTypeInformation
+    Write-Host "azure_disks_inventory_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
+}
+if ($Selected.AVS -and $AVSClusters.Count) {
+    $AVSClusters | Export-Csv (Join-Path $outdir "azure_avs_clusters_$dateStr.csv") -NoTypeInformation
+    Write-Host "azure_avs_clusters_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 
 # Create comprehensive summary CSV  
@@ -2828,6 +2989,58 @@ foreach ($sub in $subs) {
         }
     }
     
+    # Backup coverage per-subscription summary
+    if ($Selected.BACKUP -and $BackupItems.Count -gt 0) {
+        $subBackup = $BackupItems | Where-Object { $_.Subscription -eq $subscriptionName }
+        if ($subBackup.Count -gt 0) {
+            $protected = ($subBackup | Where-Object { $_.ProtectionState -eq 'Protected' }).Count
+            $summaryRows += [PSCustomObject]@{
+                Subscription = $subscriptionName
+                ResourceType = "Backup Items (Protected: $protected)"
+                Region = "All"
+                Count = $subBackup.Count
+                TotalSizeGB = ""
+                TotalSizeTB = ""
+                TotalSizeTiB = ""
+            }
+        }
+    }
+
+    # Unmanaged disks per-subscription summary
+    if ($Selected.UNMANAGEDISKS -and $UnmanagedDiskItems.Count -gt 0) {
+        $subDisks = $UnmanagedDiskItems | Where-Object { $_.Subscription -eq $subscriptionName }
+        if ($subDisks.Count -gt 0) {
+            $unattached = ($subDisks | Where-Object { $_.AttachedToVM -eq 'Unattached' }).Count
+            $totalDiskGB = ($subDisks | Measure-Object DiskSizeGB -Sum).Sum
+            $summaryRows += [PSCustomObject]@{
+                Subscription = $subscriptionName
+                ResourceType = "Disks (Unattached: $unattached)"
+                Region = "All"
+                Count = $subDisks.Count
+                TotalSizeGB = [math]::Round($totalDiskGB, 2)
+                TotalSizeTB = [math]::Round($totalDiskGB / 1000, 4)
+                TotalSizeTiB = [math]::Round($totalDiskGB / 1024, 4)
+            }
+        }
+    }
+
+    # AVS per-subscription summary
+    if ($Selected.AVS -and $AVSClusters.Count -gt 0) {
+        $subAVS = $AVSClusters | Where-Object { $_.Subscription -eq $subscriptionName }
+        if ($subAVS.Count -gt 0) {
+            $totalHosts = ($subAVS | Measure-Object TotalHostCount -Sum).Sum
+            $summaryRows += [PSCustomObject]@{
+                Subscription = $subscriptionName
+                ResourceType = "AVS Private Clouds (Total Hosts: $totalHosts)"
+                Region = "All"
+                Count = $subAVS.Count
+                TotalSizeGB = ""
+                TotalSizeTB = ""
+                TotalSizeTiB = ""
+            }
+        }
+    }
+
     # Add gap after each subscription
     $summaryRows += [PSCustomObject]@{ 
         Subscription = ""
@@ -2850,11 +3063,62 @@ if ($summaryRows.Count) {
 
 Write-Host "`n=== All Output Files Created Successfully ===" -ForegroundColor Green
 
+# ============================================================
+# JSON EXPORT (when OutputFormat is json or both)
+# ============================================================
+if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
+    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing JSON output..." -PercentComplete 80
+
+    # Build standardized summary block from $summaryRows
+    $jsonSummary = @{}
+    foreach ($row in $summaryRows) {
+        $rt = $row.ResourceType
+        if ($rt -and $rt -ne "") {
+            if (-not $jsonSummary.ContainsKey($rt)) {
+                $jsonSummary[$rt] = @{ count = 0; total_storage_gb = 0.0; notes = "" }
+            }
+            $jsonSummary[$rt].count      += [int]($row.Count -as [double])
+            $jsonSummary[$rt].total_storage_gb += [double]($row.TotalSizeGB -as [double])
+        }
+    }
+
+    # Collect all workload arrays
+    $allWorkloads = @{}
+    if ($VMs)               { $allWorkloads["azure_vms"]            = @($VMs) }
+    if ($StorageAccounts)   { $allWorkloads["azure_storage"]        = @($StorageAccounts) }
+    if ($FileShares)        { $allWorkloads["azure_file_shares"]    = @($FileShares) }
+    if ($NetAppVolumes)     { $allWorkloads["azure_netapp"]         = @($NetAppVolumes) }
+    if ($SQLDatabases)      { $allWorkloads["azure_sql"]            = @($SQLDatabases) }
+    if ($CosmosAccounts)    { $allWorkloads["azure_cosmos"]         = @($CosmosAccounts) }
+    if ($AKSClusters)       { $allWorkloads["azure_aks"]            = @($AKSClusters) }
+    if ($BackupItems)       { $allWorkloads["azure_backup"]         = @($BackupItems) }
+    if ($UnmanagedDiskItems){ $allWorkloads["azure_disks"]          = @($UnmanagedDiskItems) }
+    if ($AVSClusters)       { $allWorkloads["azure_avs"]            = @($AVSClusters) }
+
+    $jsonDoc = @{
+        metadata = @{
+            cloud            = "azure"
+            tenant_id        = (Get-AzContext).Tenant.Id
+            subscriptions    = @($allSubscriptions | ForEach-Object { $_.Id })
+            generated_at     = (Get-Date -Format "o")
+            script_version   = "2.0"
+            env_tag_name     = $EnvTagName
+            env_tag_values   = @($EnvTagValues)
+        }
+        summary   = $jsonSummary
+        workloads = $allWorkloads
+    }
+
+    $jsonPath = Join-Path $outdir ("azure_sizing_" + $dateStr + ".json")
+    $jsonDoc | ConvertTo-Json -Depth 10 -Compress:$false | Set-Content -Path $jsonPath -Encoding UTF8
+    Write-Host "azure_sizing_$dateStr.json written to $outdir" -ForegroundColor Cyan
+}
+
 Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Creating ZIP archive..." -PercentComplete 90
 
 Stop-Transcript
 
-# Zip results  
+# Zip results (always include everything in outdir — CSVs + JSON if present)
 $zipfile = Join-Path $PWD ("azure_sizing_" + $dateStr + ".zip")  
 Add-Type -AssemblyName System.IO.Compression.FileSystem  
 [IO.Compression.ZipFile]::CreateFromDirectory($outdir, $zipfile)  
@@ -2869,4 +3133,7 @@ Write-Host "Temporary directory removed: $outdir" -ForegroundColor Green
   
 # Show final results on console
 Write-Host "`nInventory complete. Results in $zipfile`n" -ForegroundColor Green
+if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
+    Write-Host "JSON sizing report (azure_sizing_$dateStr.json) is included in the ZIP for Sales AI Hub upload." -ForegroundColor Cyan
+}
 Write-Host "All output files have been compressed into the ZIP archive. Please provide to Commvault representative." -ForegroundColor Cyan

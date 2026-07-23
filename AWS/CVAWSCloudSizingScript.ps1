@@ -108,7 +108,8 @@ param (
     [string]$RegionToQuery,
     [switch]$SkipBucketTags,
     [switch]$DebugBucketTags,
-    [switch]$SelectiveZipping = $true
+    [switch]$SelectiveZipping = $true,
+    [ValidateSet("csv","json","both")][string]$OutputFormat = "csv"  # Output format: csv (default), json, or both
 )
 
 
@@ -246,6 +247,42 @@ EKS = @{
         RequiresTagProcessing = $true
         SpecialHandling = $true
     }
+    Aurora = @{
+        DisplayName = "Clusters"
+        GetCommand = "Get-RDSDBCluster"
+        CandidateGetCommands = @("Get-RDSDBCluster","Get-RDSCluster")
+        PropertyPath = "DBClusters"
+        SizeProperty = "Custom"
+        IdProperty = "DBClusterIdentifier"
+        StorageType = "Block"
+        ProcessorFunction = "Process-AuroraCluster"
+        RequiresTagProcessing = $true
+        SpecialHandling = $true
+    }
+    ElastiCache = @{
+        DisplayName = "Clusters"
+        GetCommand = "Get-ECCacheCluster"
+        CandidateGetCommands = @("Get-ECCacheCluster","Get-ElastiCacheCacheCluster")
+        PropertyPath = "CacheClusters"
+        SizeProperty = "Custom"
+        IdProperty = "CacheClusterId"
+        StorageType = "InMemory"
+        ProcessorFunction = "Process-ElastiCacheCluster"
+        RequiresTagProcessing = $false
+        SpecialHandling = $true
+    }
+    AWSBackup = @{
+        DisplayName = "Protected Resources"
+        GetCommand = "Get-BAKProtectedResourceList"
+        CandidateGetCommands = @("Get-BAKProtectedResourceList","Get-BKPProtectedResourceList")
+        PropertyPath = "Results"
+        SizeProperty = "Custom"
+        IdProperty = "ResourceArn"
+        StorageType = "Backup"
+        ProcessorFunction = "Process-AWSBackupResource"
+        RequiresTagProcessing = $false
+        SpecialHandling = $true
+    }
 }
 
 $script:Config = @{
@@ -282,6 +319,9 @@ $baseOutputDynamoDB = "aws_dynamodb_info"
 $baseOutputRedshift = "aws_redshift_info"
 $baseOutputEKS = "aws_eks_info"
 $baseOutputDocumentDB = "aws_documentdb_info"
+$baseOutputAurora = "aws_aurora_info"
+$baseOutputElastiCache = "aws_elasticache_info"
+$baseOutputAWSBackup = "aws_backup_protected_resources_info"
 $archiveFile = "aws_sizing_results_$date_string.zip"
 
 function Show-ScriptProgress {
@@ -580,20 +620,63 @@ function Process-EC2Instance {
 
     $sizes = Convert-BytesToSizes -Bytes $totalEbsBytes
 
-        $ec2Obj = [PSCustomObject]@{
-            AwsAccountId = "`u{200B}$($AccountInfo.Account)"
-        AwsAccountAlias = $AccountAlias
-        Region = $Region
-        InstanceId = $Item.InstanceId
-        InstanceType = $Item.InstanceType
-        State = $Item.State.Name
-        LaunchTime = $Item.LaunchTime
-        VolumeCount = $ebsVolumes.Count
-        SizeGiB = $sizes.SizeGiB
-        SizeTiB = $sizes.SizeTiB
-        SizeGB = $sizes.SizeGB
-        SizeTB = $sizes.SizeTB
-        VolumeDetails = ($ebsVolumes | ForEach-Object { "$($_.VolumeId):$($_.Size)GB:$($_.VolumeType)" }) -join ";"
+    # ── Backup coverage: check AWS Backup and native EBS snapshots ─────────
+    $awsBackupProtected = $false
+    $latestSnapshotDate = $null
+    $snapshotCount = 0
+    try {
+        $backupItems = Get-BAKListProtectedResource -Credential $Credential -Region $Region -ErrorAction SilentlyContinue
+        if ($backupItems) {
+            $awsBackupProtected = ($backupItems | Where-Object { $_.ResourceArn -like "*$($Item.InstanceId)*" }).Count -gt 0
+        }
+    } catch {}
+    try {
+        $snapFilter = @(@{ Name = 'source-instance-id'; Values = @($Item.InstanceId) })
+        $snaps = Get-EC2Snapshot -Filter $snapFilter -Credential $Credential -Region $Region -ErrorAction SilentlyContinue
+        if ($snaps) {
+            $snapshotCount = $snaps.Count
+            $latestSnap = $snaps | Sort-Object StartTime -Descending | Select-Object -First 1
+            $latestSnapshotDate = if ($latestSnap) { $latestSnap.StartTime } else { $null }
+        }
+    } catch {}
+
+    # ── Encryption: check all attached EBS volumes ─────────────────────────
+    $allEncrypted = if ($ebsVolumes.Count -gt 0) { ($ebsVolumes | Where-Object { -not $_.Encrypted }).Count -eq 0 } else { $null }
+    $encryptedVolumeCount = ($ebsVolumes | Where-Object { $_.Encrypted }).Count
+
+    # ── Platform / OS ──────────────────────────────────────────────────────
+    $platform = if ($Item.Platform) { $Item.Platform.Value ?? $Item.Platform } else { 'linux' }
+
+    # ── IAM instance profile ───────────────────────────────────────────────
+    $iamProfile = if ($Item.IamInstanceProfile) { $Item.IamInstanceProfile.Arn } else { $null }
+
+    # ── Protection status inference ────────────────────────────────────────
+    $protectionStatus = if ($awsBackupProtected) { 'Protected' }
+                        elseif ($snapshotCount -gt 0) { 'Snapshot-Only' }
+                        else { 'Unprotected' }
+
+    $ec2Obj = [PSCustomObject]@{
+        AwsAccountId          = "`u{200B}$($AccountInfo.Account)"
+        AwsAccountAlias       = $AccountAlias
+        Region                = $Region
+        InstanceId            = $Item.InstanceId
+        InstanceType          = $Item.InstanceType
+        Platform              = $platform
+        State                 = $Item.State.Name
+        LaunchTime            = $Item.LaunchTime
+        IamInstanceProfile    = $iamProfile
+        VolumeCount           = $ebsVolumes.Count
+        SizeGiB               = $sizes.SizeGiB
+        SizeTiB               = $sizes.SizeTiB
+        SizeGB                = $sizes.SizeGB
+        SizeTB                = $sizes.SizeTB
+        VolumeDetails         = ($ebsVolumes | ForEach-Object { "$($_.VolumeId):$($_.Size)GB:$($_.VolumeType)" }) -join ";"
+        AllVolumesEncrypted   = $allEncrypted
+        EncryptedVolumeCount  = $encryptedVolumeCount
+        AWSBackupProtected    = $awsBackupProtected
+        EBSSnapshotCount      = $snapshotCount
+        LatestSnapshotDate    = $latestSnapshotDate
+        ProtectionStatus      = $protectionStatus
     }
 
     Add-TagProperties -Object $ec2Obj -Tags $instanceTags
@@ -697,17 +780,66 @@ function Process-S3Bucket {
 
         $sizes = Convert-BytesToSizes -Bytes $totalBytes
 
+        # ── Versioning ────────────────────────────────────────────────────
+        $versioningStatus = 'Unknown'
+        try {
+            $vConfig = Get-S3BucketVersioning -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
+            $versioningStatus = if ($vConfig -and $vConfig.Status) { $vConfig.Status.Value ?? $vConfig.Status } else { 'Disabled' }
+        } catch { $versioningStatus = 'Unknown' }
+
+        # ── Public access block ───────────────────────────────────────────
+        $publicAccessBlocked = $null
+        try {
+            $pab = Get-S3PublicAccessBlock -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
+            $publicAccessBlocked = ($pab.BlockPublicAcls -and $pab.BlockPublicPolicy -and $pab.IgnorePublicAcls -and $pab.RestrictPublicBuckets)
+        } catch { $publicAccessBlocked = $null }
+
+        # ── Replication ───────────────────────────────────────────────────
+        $replicationEnabled = $false
+        try {
+            $replConfig = Get-S3BucketReplication -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
+            $replicationEnabled = ($replConfig -and $replConfig.Rules -and $replConfig.Rules.Count -gt 0)
+        } catch { $replicationEnabled = $false }
+
+        # ── Lifecycle rules ───────────────────────────────────────────────
+        $lifecycleRuleCount = 0
+        try {
+            $lcRules = Get-S3LifecycleConfiguration -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
+            $lifecycleRuleCount = if ($lcRules -and $lcRules.Rules) { $lcRules.Rules.Count } else { 0 }
+        } catch { $lifecycleRuleCount = 0 }
+
+        # ── Encryption ────────────────────────────────────────────────────
+        $serverSideEncryption = 'None'
+        try {
+            $encConfig = Get-S3BucketEncryption -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
+            if ($encConfig -and $encConfig.ServerSideEncryptionRules -and $encConfig.ServerSideEncryptionRules.Count -gt 0) {
+                $serverSideEncryption = $encConfig.ServerSideEncryptionRules[0].ServerSideEncryptionByDefault.SSEAlgorithm
+            }
+        } catch { $serverSideEncryption = 'Unknown' }
+
+        # ── Protection status inference ───────────────────────────────────
+        $s3ProtectionStatus = if ($replicationEnabled -and $versioningStatus -eq 'Enabled') { 'Protected' }
+                              elseif ($versioningStatus -eq 'Enabled') { 'Versioned' }
+                              elseif ($lifecycleRuleCount -gt 0) { 'Lifecycle-Only' }
+                              else { 'Unprotected' }
+
         $s3Obj = [PSCustomObject]@{
-            AwsAccountId = "`u{200B}$($AccountInfo.Account)"
-            AwsAccountAlias = $AccountAlias
-            Region = $actualRegion
-            BucketName = $bucketName
-            ObjectCount = $objectCount
-            CreationDate = if ($Item.CreationDate) { $Item.CreationDate } else { $null }
-            SizeGiB = $sizes.SizeGiB
-            SizeTiB = $sizes.SizeTiB
-            SizeGB = $sizes.SizeGB
-            SizeTB = $sizes.SizeTB
+            AwsAccountId          = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountAlias       = $AccountAlias
+            Region                = $actualRegion
+            BucketName            = $bucketName
+            ObjectCount           = $objectCount
+            CreationDate          = if ($Item.CreationDate) { $Item.CreationDate } else { $null }
+            VersioningStatus      = $versioningStatus
+            PublicAccessBlocked   = $publicAccessBlocked
+            ReplicationEnabled    = $replicationEnabled
+            LifecycleRuleCount    = $lifecycleRuleCount
+            ServerSideEncryption  = $serverSideEncryption
+            ProtectionStatus      = $s3ProtectionStatus
+            SizeGiB               = $sizes.SizeGiB
+            SizeTiB               = $sizes.SizeTiB
+            SizeGB                = $sizes.SizeGB
+            SizeTB                = $sizes.SizeTB
         }
 
         foreach ($storageClass in $storageClasses) {
@@ -749,18 +881,37 @@ function Process-EFSFileSystem {
 
     $sizes = Convert-BytesToSizes -Bytes $efsSizeBytes
 
-        $efsObj = [PSCustomObject]@{
-            AwsAccountId = "`u{200B}$($AccountInfo.Account)"
-        AwsAccountAlias = $AccountAlias
-        Region = $Region
-        FileSystemId = $Item.FileSystemId
-        CreationTime = $Item.CreationTime
-        PerformanceMode = $Item.PerformanceMode
-        State = $Item.LifeCycleState
-        SizeGiB = $sizes.SizeGiB
-        SizeTiB = $sizes.SizeTiB
-        SizeGB = $sizes.SizeGB
-        SizeTB = $sizes.SizeTB
+    # ── EFS backup policy ─────────────────────────────────────────────
+    $backupPolicyStatus = 'Unknown'
+    try {
+        $bp = Get-EFSBackupPolicy -FileSystemId $Item.FileSystemId -Credential $Credential -Region $Region -ErrorAction Stop
+        $backupPolicyStatus = if ($bp -and $bp.BackupPolicy -and $bp.BackupPolicy.Status) {
+            $bp.BackupPolicy.Status.Value ?? $bp.BackupPolicy.Status
+        } else { 'DISABLED' }
+    } catch { $backupPolicyStatus = 'Unknown' }
+
+    $efsEncrypted = if ($Item.Encrypted -ne $null) { [bool]$Item.Encrypted } else { $null }
+    $throughputMode = if ($Item.ThroughputMode) { $Item.ThroughputMode.Value ?? $Item.ThroughputMode } else { $null }
+
+    $efsProtectionStatus = if ($backupPolicyStatus -eq 'ENABLED') { 'Protected' }
+                           else { 'Unprotected' }
+
+    $efsObj = [PSCustomObject]@{
+        AwsAccountId       = "`u{200B}$($AccountInfo.Account)"
+        AwsAccountAlias    = $AccountAlias
+        Region             = $Region
+        FileSystemId       = $Item.FileSystemId
+        CreationTime       = $Item.CreationTime
+        PerformanceMode    = $Item.PerformanceMode
+        ThroughputMode     = $throughputMode
+        State              = $Item.LifeCycleState
+        Encrypted          = $efsEncrypted
+        BackupPolicyStatus = $backupPolicyStatus
+        ProtectionStatus   = $efsProtectionStatus
+        SizeGiB            = $sizes.SizeGiB
+        SizeTiB            = $sizes.SizeTiB
+        SizeGB             = $sizes.SizeGB
+        SizeTB             = $sizes.SizeTB
     }
 
     Add-TagProperties -Object $efsObj -Tags $efsTags
@@ -1268,19 +1419,22 @@ function Process-UnattachedVolume {
     $volumeBytes = $Item.Size * 1GB
     $sizes = Convert-BytesToSizes -Bytes $volumeBytes
 
+    $volEncrypted = if ($Item.Encrypted -ne $null) { [bool]$Item.Encrypted } else { $null }
+
     $volumeObj = [PSCustomObject]@{
-        AwsAccountId = "`u{200B}$($AccountInfo.Account)"
+        AwsAccountId    = "`u{200B}$($AccountInfo.Account)"
         AwsAccountAlias = $AccountAlias
-        Region = $Region
-        VolumeId = $Item.VolumeId
-        VolumeType = $Item.VolumeType
-        Size = $Item.Size
-        State = $Item.State
-        CreateTime = $Item.CreateTime
-        SizeGiB = $sizes.SizeGiB
-        SizeTiB = $sizes.SizeTiB
-        SizeGB = $sizes.SizeGB
-        SizeTB = $sizes.SizeTB
+        Region          = $Region
+        VolumeId        = $Item.VolumeId
+        VolumeType      = $Item.VolumeType
+        Size            = $Item.Size
+        State           = $Item.State
+        Encrypted       = $volEncrypted
+        CreateTime      = $Item.CreateTime
+        SizeGiB         = $sizes.SizeGiB
+        SizeTiB         = $sizes.SizeTiB
+        SizeGB          = $sizes.SizeGB
+        SizeTB          = $sizes.SizeTB
     }
 
     Add-TagProperties -Object $volumeObj -Tags $volumeTags
@@ -1349,17 +1503,53 @@ function Process-RDSInstance {
             }
         } catch {}
 
+        # ── Backup & protection fields ────────────────────────────────────
+        $backupRetentionDays = if ($Item.BackupRetentionPeriod -ne $null) { [int]$Item.BackupRetentionPeriod } else { 0 }
+        $automatedBackupsEnabled = $backupRetentionDays -gt 0
+        $multiAZ = if ($Item.MultiAZ -ne $null) { [bool]$Item.MultiAZ } else { $false }
+        $storageEncrypted = if ($Item.StorageEncrypted -ne $null) { [bool]$Item.StorageEncrypted } else { $false }
+        $deletionProtection = if ($Item.DeletionProtection -ne $null) { [bool]$Item.DeletionProtection } else { $false }
+        $dbStatus = if ($Item.DBInstanceStatus) { $Item.DBInstanceStatus } else { 'unknown' }
+
+        # ── AWS Backup coverage ───────────────────────────────────────────
+        $awsBackupProtected = $false
+        try {
+            $rps = Get-BAKRecoveryPointsByResource -ResourceArn $Item.DBInstanceArn -MaxResult 1 `
+                -Credential $Credential -Region $Region -ErrorAction SilentlyContinue
+            $awsBackupProtected = ($rps -and $rps.Count -gt 0)
+        } catch {}
+
+        $protectionStatus = if ($awsBackupProtected) { 'Protected' }
+                            elseif ($automatedBackupsEnabled) { 'Automated-Backup' }
+                            else { 'Unprotected' }
+
+        # ── PITR: RDS supports point-in-time recovery when automated backups are enabled.
+        # LatestRestorableTime shows exactly how far back you can restore.
+        $pitrEnabled = $automatedBackupsEnabled  # RDS PITR is active when BackupRetentionPeriod > 0
+        $latestRestorableTime = if ($Item.LatestRestorableTime) { $Item.LatestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+
         $rdsObj = [PSCustomObject]@{
-            AwsAccountId          = "`u{200B}$($AccountInfo.Account)"
-            AwsAccountAlias       = $AccountAlias
-            Region                = $Region
-            DBInstanceIdentifier  = $Item.DBInstanceIdentifier
-            Engine                = $Item.Engine
-            DBInstanceClass       = $Item.DBInstanceClass
-            SizeGiB               = $sizes.SizeGiB
-            SizeTiB               = $sizes.SizeTiB
-            SizeGB                = $sizes.SizeGB
-            SizeTB                = $sizes.SizeTB
+            AwsAccountId            = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountAlias         = $AccountAlias
+            Region                  = $Region
+            DBInstanceIdentifier    = $Item.DBInstanceIdentifier
+            Engine                  = $Item.Engine
+            EngineVersion           = $Item.EngineVersion
+            DBInstanceClass         = $Item.DBInstanceClass
+            DBInstanceStatus        = $dbStatus
+            MultiAZ                 = $multiAZ
+            StorageEncrypted        = $storageEncrypted
+            DeletionProtection      = $deletionProtection
+            BackupRetentionDays     = $backupRetentionDays
+            AutomatedBackupsEnabled = $automatedBackupsEnabled
+            PITREnabled             = $pitrEnabled
+            LatestRestorableTime    = $latestRestorableTime
+            AWSBackupProtected      = $awsBackupProtected
+            ProtectionStatus        = $protectionStatus
+            SizeGiB                 = $sizes.SizeGiB
+            SizeTiB                 = $sizes.SizeTiB
+            SizeGB                  = $sizes.SizeGB
+            SizeTB                  = $sizes.SizeTB
         }
 
         try {
@@ -1432,6 +1622,13 @@ function Process-DocumentDBCluster {
         $instanceTypes = $instances | ForEach-Object { $_.DBInstanceClass } | Sort-Object -Unique
         $availabilityZones = $instances | ForEach-Object { $_.AvailabilityZone } | Where-Object { $_ } | Sort-Object -Unique
 
+        # ── PITR: DocumentDB supports PITR when BackupRetentionPeriod > 0.
+        # EarliestRestorableTime / LatestRestorableTime show the actual restore window.
+        $docdbBackupDays = if ($Item.BackupRetentionPeriod) { [int]$Item.BackupRetentionPeriod } else { 0 }
+        $docdbPitrEnabled = $docdbBackupDays -gt 0
+        $docdbLatestRestore = if ($Item.LatestRestorableTime) { $Item.LatestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+        $docdbEarliestRestore = if ($Item.EarliestRestorableTime) { $Item.EarliestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+
         $docdbClusterObj = [PSCustomObject]@{
             AwsAccountId          = "`u{200B}$($AccountInfo.Account)"
             AwsAccountAlias       = $AccountAlias
@@ -1448,7 +1645,10 @@ function Process-DocumentDBCluster {
             SizeGB                = $sizes.SizeGB
             SizeTB                = $sizes.SizeTB
             ClusterCreateTime     = if ($Item.ClusterCreateTime) { $Item.ClusterCreateTime } else { $null }
-            BackupRetentionPeriod = if ($Item.BackupRetentionPeriod) { $Item.BackupRetentionPeriod } else { 0 }
+            BackupRetentionPeriod = $docdbBackupDays
+            PITREnabled           = $docdbPitrEnabled
+            LatestRestorableTime  = $docdbLatestRestore
+            EarliestRestorableTime = $docdbEarliestRestore
             PreferredBackupWindow = if ($Item.PreferredBackupWindow) { $Item.PreferredBackupWindow } else { $null }
             PreferredMaintenanceWindow = if ($Item.PreferredMaintenanceWindow) { $Item.PreferredMaintenanceWindow } else { $null }
         }
@@ -1465,6 +1665,140 @@ function Process-DocumentDBCluster {
         return $docdbClusterObj
     } catch {
         Write-ScriptOutput "Failed to process DocumentDB cluster $($Item.DBClusterIdentifier): $($_.Exception.Message)" -Level Warning
+        return $null
+    }
+}
+
+function Process-AuroraCluster {
+    param($Item, $Credential, $Region, $AccountInfo, $AccountAlias)
+    try {
+        $clusterId = $Item.DBClusterIdentifier
+        # Only Aurora engines — skip plain RDS clusters surfaced by Get-RDSDBCluster
+        if ($Item.Engine -notmatch '^aurora') { return $null }
+
+        $totalBytes = 0
+        try {
+            $metric = Get-SafeCWMetricStatistic -Namespace 'AWS/RDS' -MetricName 'VolumeBytesUsed' `
+                -Dimensions @(@{Name='DBClusterIdentifier';Value=$clusterId}) `
+                -Period 86400 -Statistics 'Maximum' -Credential $Credential -Region $Region
+            if ($metric -and $metric.Datapoints -and $metric.Datapoints.Count -gt 0) {
+                $mv = ($metric.Datapoints | Sort-Object Timestamp -Descending | Select-Object -First 1).Maximum
+                if ($mv -gt 0) { $totalBytes = [double]$mv }
+            }
+        } catch { Write-ScriptOutput "CloudWatch metrics failed for Aurora cluster ${clusterId}: $_" -Level Warning }
+
+        $sizes = Convert-BytesToSizes -Bytes $totalBytes
+        # ── PITR: Aurora PITR is active when BackupRetentionPeriod > 0.
+        # EarliestRestorableTime / LatestRestorableTime show the actual restore window.
+        $aurPitrEnabled = ($Item.BackupRetentionPeriod -ne $null) -and ([int]$Item.BackupRetentionPeriod -gt 0)
+        $aurLatestRestore = if ($Item.LatestRestorableTime) { $Item.LatestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+        $aurEarliestRestore = if ($Item.EarliestRestorableTime) { $Item.EarliestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+
+        $auroraObj = [PSCustomObject]@{
+            AwsAccountId          = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountAlias       = $AccountAlias
+            Region                = $Region
+            DBClusterIdentifier   = $clusterId
+            Engine                = $Item.Engine
+            EngineVersion         = $Item.EngineVersion
+            EngineMode            = $Item.EngineMode       # provisioned / serverless / parallelquery
+            ClusterStatus         = $Item.Status
+            MultiAZ               = $Item.MultiAZ
+            DatabaseName          = $Item.DatabaseName
+            ReaderEndpoint        = $Item.ReaderEndpoint
+            Endpoint              = $Item.Endpoint
+            InstanceCount         = ($Item.DBClusterMembers | Measure-Object).Count
+            BackupRetentionDays   = $Item.BackupRetentionPeriod
+            PITREnabled           = $aurPitrEnabled
+            LatestRestorableTime  = $aurLatestRestore
+            EarliestRestorableTime = $aurEarliestRestore
+            SizeGiB               = $sizes.SizeGiB
+            SizeTiB               = $sizes.SizeTiB
+            SizeGB                = $sizes.SizeGB
+            SizeTB                = $sizes.SizeTB
+        }
+        try {
+            if ($Item.DBClusterArn -and (Get-Command Get-RDSTag -ErrorAction SilentlyContinue)) {
+                $tags = Get-RDSTag -ResourceName $Item.DBClusterArn -Credential $Credential -Region $Region -ErrorAction SilentlyContinue
+                Add-TagProperties -Object $auroraObj -Tags $tags
+            }
+        } catch {}
+        return $auroraObj
+    } catch {
+        Write-ScriptOutput "Failed to process Aurora cluster $($Item.DBClusterIdentifier): $_" -Level Warning
+        return $null
+    }
+}
+
+function Process-ElastiCacheCluster {
+    param($Item, $Credential, $Region, $AccountInfo, $AccountAlias)
+    try {
+        # Node count and type for size estimation
+        $nodeType  = $Item.CacheNodeType
+        $nodeCount = if ($Item.NumCacheNodes) { $Item.NumCacheNodes } else { 1 }
+
+        # Map instance family to approximate RAM GB for sizing context
+        $approxRamGB = 0
+        if ($nodeType -match '\.(\w+)$') {
+            $size = $Matches[1]
+            $approxRamGB = switch ($size) {
+                'micro'    { 0.555 }; 'small'   { 1.55 };  'medium'  { 3.09 }
+                'large'    { 6.38 };  'xlarge'  { 14.28 }; '2xlarge' { 28.56 }
+                '4xlarge'  { 58.2 };  '8xlarge' { 118.8 }; '12xlarge'{ 193.6 }
+                '16xlarge' { 209 };   default   { 0 }
+            }
+        }
+        $totalRamGB = [math]::Round($approxRamGB * $nodeCount, 2)
+
+        $ecObj = [PSCustomObject]@{
+            AwsAccountId       = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountAlias    = $AccountAlias
+            Region             = $Region
+            CacheClusterId     = $Item.CacheClusterId
+            Engine             = $Item.Engine
+            EngineVersion      = $Item.EngineVersion
+            CacheNodeType      = $nodeType
+            NumCacheNodes      = $nodeCount
+            ClusterStatus      = $Item.CacheClusterStatus
+            ApproxTotalRAMGB   = $totalRamGB   # sizing proxy for backup capacity
+            PreferredAZ        = $Item.PreferredAvailabilityZone
+            ReplicationGroupId = $Item.ReplicationGroupId
+            SnapshotRetentionDays = $Item.SnapshotRetentionLimit
+        }
+        return $ecObj
+    } catch {
+        Write-ScriptOutput "Failed to process ElastiCache cluster $($Item.CacheClusterId): $_" -Level Warning
+        return $null
+    }
+}
+
+function Process-AWSBackupResource {
+    param($Item, $Credential, $Region, $AccountInfo, $AccountAlias)
+    try {
+        # Get the most recent recovery point for this resource to show last backup time
+        $lastBackupTime = $null
+        $backupStatus   = 'Unknown'
+        try {
+            $rps = Get-BAKRecoveryPointsByResource -ResourceArn $Item.ResourceArn -MaxResult 1 `
+                -Credential $Credential -Region $Region -ErrorAction SilentlyContinue
+            if ($rps -and $rps.Count -gt 0) {
+                $lastBackupTime = $rps[0].CreationDate
+                $backupStatus   = $rps[0].Status
+            }
+        } catch {}
+
+        return [PSCustomObject]@{
+            AwsAccountId      = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountAlias   = $AccountAlias
+            Region            = $Region
+            ResourceArn       = $Item.ResourceArn
+            ResourceType      = $Item.ResourceType
+            LastBackupTime    = $lastBackupTime
+            LastBackupStatus  = $backupStatus
+            LastBackupSizeGB  = if ($rps -and $rps[0].BackupSizeInBytes) { [math]::Round($rps[0].BackupSizeInBytes/1GB,4) } else { 0 }
+        }
+    } catch {
+        Write-ScriptOutput "Failed to process AWS Backup resource $($Item.ResourceArn): $_" -Level Warning
         return $null
     }
 }
@@ -1511,6 +1845,20 @@ function Process-DynamoDBTable {
 
         $sizes = Convert-BytesToSizes -Bytes $tableSizeBytes
 
+        # ── PITR (point-in-time recovery) ────────────────────────────────
+        $pitrEnabled = $false
+        try {
+            $cbs = Get-DDBContinuousBackup -TableName $tableName -Credential $Credential -Region $Region -ErrorAction Stop
+            $pitrStatus = if ($cbs -and $cbs.ContinuousBackupsDescription) {
+                $cbs.ContinuousBackupsDescription.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus
+            } elseif ($cbs) {
+                $cbs.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus
+            } else { $null }
+            $pitrEnabled = ($pitrStatus -ne $null) -and ($pitrStatus.ToString() -eq 'ENABLED')
+        } catch { $pitrEnabled = $false }
+
+        $ddbProtectionStatus = if ($pitrEnabled) { 'Protected' } else { 'Unprotected' }
+
         $ddbObj = [PSCustomObject]@{
             AwsAccountId     = "`u{200B}$($AccountInfo.Account)"
             AwsAccountAlias  = $AccountAlias
@@ -1521,6 +1869,8 @@ function Process-DynamoDBTable {
             TableSizeBytes   = $tableSizeBytes
             TableStatus      = $tableStatus
             ItemCount        = $itemCount
+            PITREnabled      = $pitrEnabled
+            ProtectionStatus = $ddbProtectionStatus
             TableSizeGiB     = $sizes.SizeGiB
             TableSizeTiB     = $sizes.SizeTiB
             TableSizeGB      = $sizes.SizeGB
@@ -1601,18 +1951,30 @@ function Process-RedshiftCluster {
 
         $totalSizes = Convert-BytesToSizes -Bytes $totalBytes
 
-        $rsObj = [PSCustomObject]@{
-            AwsAccountId      = "`u{200B}$($AccountInfo.Account)"
-            AwsAccountAlias   = $AccountAlias
-            Region            = $Region
-            ClusterIdentifier = $clusterId
-            NodeType          = $nodeType
-            NodeCount         = $nodeCount
+        # ── Backup & security fields ──────────────────────────────────────
+        $rsEncrypted = if ($Item.Encrypted -ne $null) { [bool]$Item.Encrypted } else { $false }
+        $rsAutomatedSnapshotRetention = if ($Item.AutomatedSnapshotRetentionPeriod -ne $null) { [int]$Item.AutomatedSnapshotRetentionPeriod } else { 0 }
+        $rsClusterStatus = if ($Item.ClusterStatus) { $Item.ClusterStatus } else { 'unknown' }
+        $rsPubliclyAccessible = if ($Item.PubliclyAccessible -ne $null) { [bool]$Item.PubliclyAccessible } else { $false }
 
-            TotalSizeGiB      = $totalSizes.SizeGiB
-            TotalSizeTiB      = $totalSizes.SizeTiB
-            TotalSizeGB       = $totalSizes.SizeGB
-            TotalSizeTB       = $totalSizes.SizeTB
+        $rsProtectionStatus = if ($rsAutomatedSnapshotRetention -gt 0) { 'Automated-Backup' } else { 'Unprotected' }
+
+        $rsObj = [PSCustomObject]@{
+            AwsAccountId                    = "`u{200B}$($AccountInfo.Account)"
+            AwsAccountAlias                 = $AccountAlias
+            Region                          = $Region
+            ClusterIdentifier               = $clusterId
+            ClusterStatus                   = $rsClusterStatus
+            NodeType                        = $nodeType
+            NodeCount                       = $nodeCount
+            Encrypted                       = $rsEncrypted
+            PubliclyAccessible              = $rsPubliclyAccessible
+            AutomatedSnapshotRetentionDays  = $rsAutomatedSnapshotRetention
+            ProtectionStatus                = $rsProtectionStatus
+            TotalSizeGiB                    = $totalSizes.SizeGiB
+            TotalSizeTiB                    = $totalSizes.SizeTiB
+            TotalSizeGB                     = $totalSizes.SizeGB
+            TotalSizeTB                     = $totalSizes.SizeTB
         }
 
         try {
@@ -2059,7 +2421,10 @@ function Export-ServiceCSVFiles {
         $outputFileDynamoDB = "${baseOutputDynamoDB}_${accountSuffix}_$date_string.csv"
         $outputFileRedshift = "${baseOutputRedshift}_${accountSuffix}_$date_string.csv"
         $outputFileEKS = "${baseOutputEKS}_${accountSuffix}_$date_string.csv"
-        $outputFileDocumentDB = "${baseOutputDocumentDB}_${accountSuffix}_$date_string.csv"
+        $outputFileDocumentDB   = "${baseOutputDocumentDB}_${accountSuffix}_$date_string.csv"
+        $outputFileAurora       = "${baseOutputAurora}_${accountSuffix}_$date_string.csv"
+        $outputFileElastiCache  = "${baseOutputElastiCache}_${accountSuffix}_$date_string.csv"
+        $outputFileAWSBackup    = "${baseOutputAWSBackup}_${accountSuffix}_$date_string.csv"
 
 
         $serviceExports = @{
@@ -2074,6 +2439,9 @@ function Export-ServiceCSVFiles {
             Redshift = @{ File = $outputFileRedshift; Data = $script:ServiceDataByAccount[$AccountId]["Redshift"] }
             EKS = @{ File = $outputFileEKS; Data = $script:ServiceDataByAccount[$AccountId]["EKS"] }
             DocumentDB = @{ File = $outputFileDocumentDB; Data = $script:ServiceDataByAccount[$AccountId]["DocumentDB"] }
+            Aurora = @{ File = $outputFileAurora; Data = $script:ServiceDataByAccount[$AccountId]["Aurora"] }
+            ElastiCache = @{ File = $outputFileElastiCache; Data = $script:ServiceDataByAccount[$AccountId]["ElastiCache"] }
+            AWSBackup = @{ File = $outputFileAWSBackup; Data = $script:ServiceDataByAccount[$AccountId]["AWSBackup"] }
         }
 
         foreach ($serviceName in $serviceExports.Keys) {
@@ -3231,6 +3599,184 @@ try {
             $count = $script:ServiceDataByAccount[$account.Account][$serviceName].Count
             Write-ScriptOutput "  $serviceName`: $count items" -Level Info
         }
+    }
+
+    # ============================================================
+    # JSON EXPORT (when OutputFormat is json or both)
+    # ============================================================
+    if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
+        Write-ScriptOutput "Writing JSON sizing output..." -Level Info
+        $jsonSummary = @{}
+        $allWorkloads = @{}
+
+        # Map each service to the GB property on its workload objects
+        $serviceSizeField = @{
+            EC2              = "SizeGB"
+            S3               = "SizeGB"
+            EFS              = "SizeGB"
+            FSX              = "SizeGB"
+            FSX_SVM          = $null
+            EKS              = $null
+            UnattachedVolumes = "SizeGB"
+            RDS              = "SizeGB"
+            DynamoDB         = "TableSizeGB"
+            Redshift         = "TotalSizeGB"
+            DocumentDB       = "SizeGB"
+            Aurora           = "SizeGB"
+            ElastiCache      = $null
+            AWSBackup        = "LastBackupSizeGB"
+        }
+
+        foreach ($account in $script:AccountsProcessed) {
+            foreach ($serviceName in $script:ServiceRegistry.Keys) {
+                $items = @($script:ServiceDataByAccount[$account.Account][$serviceName])
+                if ($items.Count -gt 0) {
+                    $key = "aws_" + $serviceName.ToLower()
+                    if (-not $allWorkloads.ContainsKey($key)) { $allWorkloads[$key] = @() }
+                    $allWorkloads[$key] += $items
+                }
+                if (-not $jsonSummary.ContainsKey($serviceName)) {
+                    $jsonSummary[$serviceName] = @{ count = 0; total_storage_gb = 0.0; notes = "" }
+                }
+                $jsonSummary[$serviceName].count += $items.Count
+
+                # Accumulate storage from each workload item
+                $sizeField = $serviceSizeField[$serviceName]
+                if ($sizeField -and $items.Count -gt 0) {
+                    foreach ($item in $items) {
+                        $val = $item.$sizeField
+                        if ($null -ne $val) {
+                            $jsonSummary[$serviceName].total_storage_gb += [double]$val
+                        }
+                    }
+                }
+            }
+        }
+
+        # Round all totals to 4 decimal places
+        foreach ($key in @($jsonSummary.Keys)) {
+            $jsonSummary[$key].total_storage_gb = [math]::Round($jsonSummary[$key].total_storage_gb, 4)
+        }
+
+        # ── Protection summary (cross-service) ────────────────────────────
+        function Get-ProtectionCounts {
+            param([array]$Items)
+            if (-not $Items -or $Items.Count -eq 0) {
+                return @{ protected = 0; unprotected = 0; partial = 0; total = 0; coverage_pct = 0.0 }
+            }
+            $protected   = ($Items | Where-Object { $_.ProtectionStatus -eq 'Protected' }).Count
+            $automated   = ($Items | Where-Object { $_.ProtectionStatus -in @('Automated-Backup','Snapshot-Only','Versioned') }).Count
+            $unprotected = ($Items | Where-Object { $_.ProtectionStatus -eq 'Unprotected' -or -not $_.ProtectionStatus }).Count
+            $total       = $Items.Count
+            $coveredCount = $protected + $automated
+            return @{
+                protected       = $protected
+                partial         = $automated
+                unprotected     = $unprotected
+                total           = $total
+                coverage_pct    = if ($total -gt 0) { [math]::Round(($coveredCount / $total) * 100, 1) } else { 0.0 }
+            }
+        }
+
+        $protectionSummary = @{}
+
+        # EC2
+        $ec2Items = @($allWorkloads['aws_ec2'])
+        $protectionSummary['EC2'] = Get-ProtectionCounts -Items $ec2Items
+        $protectionSummary['EC2']['encrypted_volumes_pct'] = if ($ec2Items.Count -gt 0) {
+            $encTotal = ($ec2Items | Where-Object { $_.AllVolumesEncrypted -eq $true }).Count
+            [math]::Round(($encTotal / $ec2Items.Count) * 100, 1)
+        } else { 0.0 }
+
+        # RDS
+        $rdsItems = @($allWorkloads['aws_rds'])
+        $protectionSummary['RDS'] = Get-ProtectionCounts -Items $rdsItems
+        $protectionSummary['RDS']['multi_az_pct'] = if ($rdsItems.Count -gt 0) {
+            [math]::Round((($rdsItems | Where-Object { $_.MultiAZ -eq $true }).Count / $rdsItems.Count) * 100, 1)
+        } else { 0.0 }
+        $protectionSummary['RDS']['encrypted_pct'] = if ($rdsItems.Count -gt 0) {
+            [math]::Round((($rdsItems | Where-Object { $_.StorageEncrypted -eq $true }).Count / $rdsItems.Count) * 100, 1)
+        } else { 0.0 }
+
+        # S3
+        $s3Items = @($allWorkloads['aws_s3'])
+        $protectionSummary['S3'] = Get-ProtectionCounts -Items $s3Items
+        $protectionSummary['S3']['versioned_pct'] = if ($s3Items.Count -gt 0) {
+            [math]::Round((($s3Items | Where-Object { $_.VersioningStatus -eq 'Enabled' }).Count / $s3Items.Count) * 100, 1)
+        } else { 0.0 }
+        $protectionSummary['S3']['public_access_exposed_count'] = ($s3Items | Where-Object { $_.PublicAccessBlocked -eq $false }).Count
+
+        # EFS
+        $efsItems = @($allWorkloads['aws_efs'])
+        $protectionSummary['EFS'] = Get-ProtectionCounts -Items $efsItems
+        $protectionSummary['EFS']['encrypted_pct'] = if ($efsItems.Count -gt 0) {
+            [math]::Round((($efsItems | Where-Object { $_.Encrypted -eq $true }).Count / $efsItems.Count) * 100, 1)
+        } else { 0.0 }
+
+        # DynamoDB
+        $ddbItems = @($allWorkloads['aws_dynamodb'])
+        $protectionSummary['DynamoDB'] = Get-ProtectionCounts -Items $ddbItems
+        $protectionSummary['DynamoDB']['pitr_enabled_count'] = ($ddbItems | Where-Object { $_.PITREnabled -eq $true }).Count
+
+        # Redshift
+        $rsItems = @($allWorkloads['aws_redshift'])
+        $protectionSummary['Redshift'] = Get-ProtectionCounts -Items $rsItems
+        $protectionSummary['Redshift']['encrypted_pct'] = if ($rsItems.Count -gt 0) {
+            [math]::Round((($rsItems | Where-Object { $_.Encrypted -eq $true }).Count / $rsItems.Count) * 100, 1)
+        } else { 0.0 }
+
+        # Unattached Volumes
+        $uvItems = @($allWorkloads['aws_unattachedvolumes'])
+        $uvEncryptedCount = ($uvItems | Where-Object { $_.Encrypted -eq $true }).Count
+        $protectionSummary['UnattachedVolumes'] = @{
+            total               = $uvItems.Count
+            encrypted_count     = $uvEncryptedCount
+            unencrypted_count   = $uvItems.Count - $uvEncryptedCount
+        }
+
+        # Aurora
+        $auroraItems = @($allWorkloads['aws_aurora'])
+        $protectionSummary['Aurora'] = @{
+            total          = $auroraItems.Count
+            multi_az_count = ($auroraItems | Where-Object { $_.MultiAZ -eq $true }).Count
+            protected      = ($auroraItems | Where-Object { [int]$_.BackupRetentionDays -gt 0 }).Count
+            unprotected    = ($auroraItems | Where-Object { [int]$_.BackupRetentionDays -eq 0 }).Count
+        }
+
+        # Cross-service totals
+        $allProtectable = @('EC2','RDS','S3','EFS','DynamoDB','Redshift')
+        $totalProtected   = ($allProtectable | ForEach-Object { $protectionSummary[$_].protected ?? 0 } | Measure-Object -Sum).Sum
+        $totalPartial     = ($allProtectable | ForEach-Object { $protectionSummary[$_].partial ?? 0 } | Measure-Object -Sum).Sum
+        $totalUnprotected = ($allProtectable | ForEach-Object { $protectionSummary[$_].unprotected ?? 0 } | Measure-Object -Sum).Sum
+        $totalWorkloads   = $totalProtected + $totalPartial + $totalUnprotected
+        $protectionSummary['_overall'] = @{
+            total_workloads      = $totalWorkloads
+            fully_protected      = $totalProtected
+            partially_protected  = $totalPartial
+            unprotected          = $totalUnprotected
+            overall_coverage_pct = if ($totalWorkloads -gt 0) {
+                [math]::Round((($totalProtected + $totalPartial) / $totalWorkloads) * 100, 1)
+            } else { 0.0 }
+        }
+
+        $jsonDoc = @{
+            metadata = @{
+                cloud          = "aws"
+                accounts       = @($script:AccountsProcessed | ForEach-Object { $_.Account })
+                generated_at   = (Get-Date -Format "o")
+                script_version = "2.0"
+            }
+            summary            = $jsonSummary
+            protection_summary = $protectionSummary
+            workloads          = $allWorkloads
+        }
+
+        $jsonTimestamp = (Get-Date -Format "yyyy-MM-dd_HHmmss")
+        $jsonOutDir = if ($script:OutputDirectory) { $script:OutputDirectory } else { $PSScriptRoot }
+        if (-not (Test-Path $jsonOutDir)) { New-Item -ItemType Directory -Path $jsonOutDir -Force | Out-Null }
+        $jsonPath = Join-Path $jsonOutDir ("aws_sizing_" + $jsonTimestamp + ".json")
+        $jsonDoc | ConvertTo-Json -Depth 10 | Set-Content -Path $jsonPath -Encoding UTF8
+        Write-ScriptOutput "JSON sizing report written: $jsonPath" -Level Success
     }
 
     if ($SelectiveZipping -and $script:AllOutputFiles.Count -gt 1) {
