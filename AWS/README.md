@@ -15,9 +15,13 @@ The script collects information for the following services:
 - **DocumentDB** — Clusters  
 - **Redshift** — Clusters  
 - **EKS** — Clusters and Associated PVCs
+- **Aurora** — Clusters with PITR and restore window details
+- **ElastiCache** — Clusters with node type and RAM estimates
+- **AWS Backup** — Protected resources with last backup time and size
 
 The inventory captures **provisioned size details for applicable services** (and **used size for S3**), along with other configuration and metadata information.  
-Results are exported as timestamped Excel workbooks and consolidated ZIP archives for easy sharing and reporting.
+Each workload is enriched with **protection status**, backup coverage, encryption, and compliance fields.  
+Results are exported as timestamped Excel workbooks, consolidated ZIP archives, and optionally as structured **JSON** for AI-driven deliverable generation.
 
 ## Requirements
 - **PowerShell 7**  
@@ -104,12 +108,13 @@ Method 2 — Run locally
    ```
 
 Common script parameters
-- -DefaultProfile — Uses default AWS CLI profile / CloudShell role.
-- -UserSpecifiedProfileNames "Profile1,Profile2" — comma-separated local profiles.
-- -AllLocalProfiles — process all local profiles given in Credential File.
-- -ProfileLocation "<path>" — shared Credentials file path.
-- -CrossAccountRoleName "<RoleName>" — role to assume in target accounts.
-- -Regions "us-east-1,us-west-2" — comma-separated regions to query.
+- `-DefaultProfile` — Uses default AWS CLI profile / CloudShell role.
+- `-UserSpecifiedProfileNames "Profile1,Profile2"` — comma-separated local profiles.
+- `-AllLocalProfiles` — process all local profiles given in Credential File.
+- `-ProfileLocation "<path>"` — shared Credentials file path.
+- `-CrossAccountRoleName "<RoleName>"` — role to assume in target accounts.
+- `-Regions "us-east-1,us-west-2"` — comma-separated regions to query.
+- `-OutputFormat csv|json|both` — output format (default: `csv`). Use `json` or `both` to generate a structured JSON file consumable by AI tools for PPT/PDF/HTML deliverable generation.
 
 
 Credential Files:
@@ -150,10 +155,20 @@ Example invocations
 Outputs
 -------
 Files are written to the working directory with timestamps:
-- `<AccountId>_summary_YYYY-MM-DD_HHMMSS.xlsx` — per-account Excel summary & detail sheets(EC2, S3, RDS, FSx, EFS, DynamoDB, Redshift, EKS)
+- `<AccountId>_summary_YYYY-MM-DD_HHMMSS.xlsx` — per-account Excel summary & detail sheets (EC2, S3, RDS, FSx, EFS, DynamoDB, Redshift, EKS, Aurora, ElastiCache, AWS Backup)
 - `comprehensive_all_aws_accounts_summary_YYYY-MM-DD_HHMMSS.xlsx` — consolidated workbook
 - `aws_sizing_script_output_YYYY-MM-DD_HHMMSS.log` — execution log
-- `aws_sizing_results_YYYY-MM-DD_HHMMSS.zip` — ZIP archive 
+- `aws_sizing_results_YYYY-MM-DD_HHMMSS.zip` — ZIP archive
+- `aws_sizing_YYYY-MM-DD_HHMMSS.json` *(when `-OutputFormat json|both`)* — structured JSON with `metadata`, `summary`, `protection_summary`, and per-service `workloads` arrays; ideal for AI-generated sizing deliverables
+
+### JSON protection_summary fields
+The JSON output includes per-service protection metrics (coverage %, encrypted %, multi-AZ %, PITR status) and an `_overall` block with `overall_coverage_pct` across all protectable workloads.
+
+### FetchAllAccountCreds.ps1
+Automatically fetches temporary credentials for all SSO-accessible AWS accounts and runs the sizing script across all of them in one pass, producing a combined JSON output.
+```powershell
+.\FetchAllAccountCreds.ps1 -SsoStartUrl "https://your-org.awsapps.com/start" -SsoRegion us-east-1 -OutputFormat json
+```
 
 
 Required IAM Permissions
@@ -198,7 +213,18 @@ The executing user/role must have the following IAM permissions for the script t
                 "eks:ListClusters",
                 "eks:DescribeCluster",
                 "eks:ListNodegroups",
-                "eks:ListTagsForResource"
+                "eks:ListTagsForResource",
+                "backup:ListProtectedResources",
+                "backup:ListRecoveryPointsByResource",
+                "s3:GetBucketVersioning",
+                "s3:GetBucketReplication",
+                "s3:GetLifecycleConfiguration",
+                "s3:GetEncryptionConfiguration",
+                "s3:GetPublicAccessBlock",
+                "elasticfilesystem:DescribeBackupPolicy",
+                "rds:DescribeDBInstanceAutomatedBackups",
+                "dynamodb:DescribeContinuousBackups",
+                "elasticache:DescribeCacheClusters"
             ],
             "Resource": "*"
         }
