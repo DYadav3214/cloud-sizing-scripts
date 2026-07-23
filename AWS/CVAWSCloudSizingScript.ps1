@@ -3692,7 +3692,7 @@ try {
         $protectionSummary = @{}
 
         # EC2
-        $ec2Items = @($allWorkloads['aws_ec2'])
+        $ec2Items = @($allWorkloads['aws_ec2'] | Where-Object { $_ -ne $null })
         $protectionSummary['EC2'] = Get-ProtectionCounts -Items $ec2Items
         $protectionSummary['EC2']['encrypted_volumes_pct'] = if ($ec2Items.Count -gt 0) {
             $encTotal = ($ec2Items | Where-Object { $_.AllVolumesEncrypted -eq $true }).Count
@@ -3700,7 +3700,7 @@ try {
         } else { 0.0 }
 
         # RDS
-        $rdsItems = @($allWorkloads['aws_rds'])
+        $rdsItems = @($allWorkloads['aws_rds'] | Where-Object { $_ -ne $null })
         $protectionSummary['RDS'] = Get-ProtectionCounts -Items $rdsItems
         $protectionSummary['RDS']['multi_az_pct'] = if ($rdsItems.Count -gt 0) {
             [math]::Round((($rdsItems | Where-Object { $_.MultiAZ -eq $true }).Count / $rdsItems.Count) * 100, 1)
@@ -3710,7 +3710,7 @@ try {
         } else { 0.0 }
 
         # S3
-        $s3Items = @($allWorkloads['aws_s3'])
+        $s3Items = @($allWorkloads['aws_s3'] | Where-Object { $_ -ne $null })
         $protectionSummary['S3'] = Get-ProtectionCounts -Items $s3Items
         $protectionSummary['S3']['versioned_pct'] = if ($s3Items.Count -gt 0) {
             [math]::Round((($s3Items | Where-Object { $_.VersioningStatus -eq 'Enabled' }).Count / $s3Items.Count) * 100, 1)
@@ -3718,26 +3718,26 @@ try {
         $protectionSummary['S3']['public_access_exposed_count'] = ($s3Items | Where-Object { $_.PublicAccessBlocked -eq $false }).Count
 
         # EFS
-        $efsItems = @($allWorkloads['aws_efs'])
+        $efsItems = @($allWorkloads['aws_efs'] | Where-Object { $_ -ne $null })
         $protectionSummary['EFS'] = Get-ProtectionCounts -Items $efsItems
         $protectionSummary['EFS']['encrypted_pct'] = if ($efsItems.Count -gt 0) {
             [math]::Round((($efsItems | Where-Object { $_.Encrypted -eq $true }).Count / $efsItems.Count) * 100, 1)
         } else { 0.0 }
 
         # DynamoDB
-        $ddbItems = @($allWorkloads['aws_dynamodb'])
+        $ddbItems = @($allWorkloads['aws_dynamodb'] | Where-Object { $_ -ne $null })
         $protectionSummary['DynamoDB'] = Get-ProtectionCounts -Items $ddbItems
         $protectionSummary['DynamoDB']['pitr_enabled_count'] = ($ddbItems | Where-Object { $_.PITREnabled -eq $true }).Count
 
         # Redshift
-        $rsItems = @($allWorkloads['aws_redshift'])
+        $rsItems = @($allWorkloads['aws_redshift'] | Where-Object { $_ -ne $null })
         $protectionSummary['Redshift'] = Get-ProtectionCounts -Items $rsItems
         $protectionSummary['Redshift']['encrypted_pct'] = if ($rsItems.Count -gt 0) {
             [math]::Round((($rsItems | Where-Object { $_.Encrypted -eq $true }).Count / $rsItems.Count) * 100, 1)
         } else { 0.0 }
 
         # Unattached Volumes
-        $uvItems = @($allWorkloads['aws_unattachedvolumes'])
+        $uvItems = @($allWorkloads['aws_unattachedvolumes'] | Where-Object { $_ -ne $null })
         $uvEncryptedCount = ($uvItems | Where-Object { $_.Encrypted -eq $true }).Count
         $protectionSummary['UnattachedVolumes'] = @{
             total               = $uvItems.Count
@@ -3746,7 +3746,7 @@ try {
         }
 
         # Aurora
-        $auroraItems = @($allWorkloads['aws_aurora'])
+        $auroraItems = @($allWorkloads['aws_aurora'] | Where-Object { $_ -ne $null })
         $protectionSummary['Aurora'] = @{
             total          = $auroraItems.Count
             multi_az_count = ($auroraItems | Where-Object { $_.MultiAZ -eq $true }).Count
@@ -3775,7 +3775,7 @@ try {
                 cloud          = "aws"
                 accounts       = @($script:AccountsProcessed | ForEach-Object { $_.Account })
                 generated_at   = (Get-Date -Format "o")
-                script_version = "2.1"
+                script_version = "2.2"
             }
             summary            = $jsonSummary
             protection_summary = $protectionSummary
